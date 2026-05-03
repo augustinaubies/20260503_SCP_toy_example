@@ -25,7 +25,7 @@ U_k = [0; 0];
 % Target and obstacles
 final_state = [10;10;0;0];
 obs_position    = [5;5];
-obs_radius      = 3;
+obs_radius      = 0.1;
 
 % Control
 dt_ctrl = 0.1;
@@ -131,6 +131,11 @@ function [ctrl_time, ctrl_values, updated_ctrls, SCP_param] = get_ctrl_values(cu
     N = SCP_param.N;
 
     if (time_since_last_ctrl >= SCP_param.dt_SCP)
+
+        nz = SCP_param.nz;
+        nu = SCP_param.nu;
+        nx = SCP_param.nx;
+        N = SCP_param.N;
         
         z_k = update_SCP_z_vector(SCP_param, current_states);
 
@@ -145,66 +150,23 @@ function [ctrl_time, ctrl_values, updated_ctrls, SCP_param] = get_ctrl_values(cu
         C  = full(C);
         JC = full(JC);
 
+        % Normalization
         [gJ_n, HJ_n, F_n, JF_n, C_n, JC_n] = normalize_operators(gJ, HJ, F, JF, C, JC, sz, scales, N);
 
-        clear gJ HJ F JF C JC
-
-        % Formulate the QP
-        nz = SCP_param.nz;
-        nu = SCP_param.nu;
-        nx = SCP_param.nx;
-        N = SCP_param.N;
-        nF = length(F_n);
-        nC = length(C_n);
-
-        rho      = SCP_param.rho;
-        trust    = SCP_param.trust_region;   % e.g. 0.2 or 0.5 in normalized units
-        slackMax = SCP_param.slack_max;      % e.g. 1e-2 to 1
-
-        % --- QP cost ---
-        % quadprog solves: 0.5*y'*H_qp*y + f_qp'*y
-        H_qp = blkdiag(HJ_n, 2*rho*speye(nF));
-        f_qp = [gJ_n; zeros(nF,1)];
-
-        % --- Equality constraints: normalized dynamics ---
-        % F + JF*delta_z_norm = s
-        % => JF*delta_z_norm - s = -F
-        Aeq = [JF_n, -speye(nF)];
-        beq = -F_n;
-
-        % --- Inequality constraints ---
-        % C + JC*delta_z_norm <= 0
-        % => JC*delta_z_norm <= -C
-        Aineq = [JC_n, sparse(nC,nF)];
-        bineq = -C_n;
-    
-        % --- Bounds: trust region + slack bounds ---
-        lb = [-trust*ones(nz,1); -slackMax*ones(nF,1)];
-        ub = [ trust*ones(nz,1);  slackMax*ones(nF,1)];
-    
-        % --- Solve ---
-        opts = optimoptions('quadprog', ...
-            'Algorithm','interior-point-convex', ...
-            'Display','off');
-    
-        [y, fval, exitflag, output] = quadprog( ...
-            H_qp, f_qp, ...
-            Aineq, bineq, ...
-            Aeq, beq, ...
-            lb, ub, ...
-            [], opts);
+%         [y, fval, exitflag, output] = solve_QP_problem(gJ_n, HJ_n, F_n, JF_n, C_n, JC_n, SCP_param);
+        [y, ~, ~, ~] = solve_QP_problem(gJ_n, HJ_n, F_n, JF_n, C_n, JC_n, SCP_param);
     
         % --- Extract solution ---
         delta_z_norm = y(1:nz);
 %         s_dyn        = y(nz+1:end);
-    
+        
         % Convert normalized correction back to physical units
         delta_z = sz .* delta_z_norm;
         
         % SCP update
         z_kp1 = z_k + SCP_param.alpha * delta_z;
         SCP_param.z_k = z_kp1;
-
+        
         updated_ctrls = 1;
         ctrl_time = current_time:SCP_param.dt_SCP:current_time+SCP_param.dt_SCP * (SCP_param.N-1);
         U_kp1 = z_kp1(nx*(N+1)+1:end);
@@ -411,6 +373,65 @@ function [gJ_n, HJ_n, F_n, JF_n, C_n, JC_n] = normalize_operators( ...
 %     JF_n = JF;
 %     C_n = C;
 %     JC_n = JC;
+end
+
+function [y, fval, exitflag, output] = solve_QP_problem(gJ_n, HJ_n, F_n, JF_n, C_n, JC_n, SCP_param)
+
+        rho      = SCP_param.rho;
+        trust    = SCP_param.trust_region;
+        slackMax = SCP_param.slack_max;
+
+        nF = length(F_n);
+        nC = length(C_n);
+        nx = SCP_param.nx;
+        nz = SCP_param.nz;
+
+        % --- Split initial condition and dynamics rows ---
+        idx_init = 1:nx;
+        idx_dyn  = nx+1:nF;
+        
+        F_init  = F_n(idx_init);
+        JF_init = JF_n(idx_init,:);
+        
+        F_dyn   = F_n(idx_dyn);
+        JF_dyn  = JF_n(idx_dyn,:);
+        
+        nS = length(F_dyn);
+        
+        % --- QP cost ---
+        H_qp = blkdiag(HJ_n, 2*rho*speye(nS));
+        f_qp = [gJ_n; zeros(nS,1)];
+        
+        % --- Equality constraints ---
+        % Initial condition: hard
+        % Dynamics: relaxed with slack
+        Aeq = [
+            JF_init, sparse(nx,nS);
+            JF_dyn,  -speye(nS)
+        ];
+        
+        beq = [
+            -F_init;
+            -F_dyn
+        ];
+        
+        % --- Inequality constraints ---
+        Aineq = [JC_n, sparse(nC,nS)];
+        bineq = -C_n;
+        
+        % --- Bounds ---
+        lb = [-trust*ones(nz,1); -slackMax*ones(nS,1)];
+        ub = [ trust*ones(nz,1);  slackMax*ones(nS,1)];
+
+        % --- Solve ---
+        opts = optimoptions('quadprog', 'Display','off');
+    
+        [y, fval, exitflag, output] = quadprog( ...
+            H_qp, f_qp, ...
+            Aineq, bineq, ...
+            Aeq, beq, ...
+            lb, ub, ...
+            [], opts);
 end
 
 %% Functions : Utils
