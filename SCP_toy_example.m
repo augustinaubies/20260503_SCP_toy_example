@@ -24,8 +24,8 @@ X_kp1 = X_k;
 U_k = [0; 0];
 % Target and obstacles
 final_state = [10;10;0;0];
-obs_position    = [5;5];
-obs_radius      = 0.1;
+obs_position    = [5;5.01];
+obs_radius      = 3;
 
 % Control
 dt_ctrl = 0.1;
@@ -55,10 +55,13 @@ SCP_param.final_state = final_state;
 SCP_param.obs_position    = obs_position;
 SCP_param.obs_radius      = obs_radius;
 SCP_param.max_accel       = max_accel;
-SCP_param.rho           = 1e3;
+SCP_param.rho           = 1e8;
 SCP_param.trust_region  = 1;
 SCP_param.alpha         = 1;
-SCP_param.slack_max     = 1;
+SCP_param.slack_max     = 0.5;
+SCP_param.n_scp_iter    = 10;
+SCP_param.verbose_scp   = false;
+SCP_param.scp_delta_tol = 1e-3;
 
 % Compute useful operators for the QP formulation
 get_all_operators = initialize_SCP_solver(SCP_param);
@@ -141,35 +144,73 @@ function [ctrl_time, ctrl_values, updated_ctrls, SCP_param] = get_ctrl_values(cu
 
         [sz, scales] = build_Sz_from_z(z_k, SCP_param);
 
-        [~, gJ, HJ, F, JF, C, JC] = get_all_operators(z_k, current_states);
+        z_last_valid = z_k;
+        qp_success = false;
 
-        gJ = full(gJ);
-        HJ = full(HJ);
-        F  = full(F);
-        JF = full(JF);
-        C  = full(C);
-        JC = full(JC);
+        SCP_param.last_scp_exitflag = nan;
+        SCP_param.last_scp_delta_norm = nan;
+        SCP_param.last_scp_sdyn_norm = nan;
+        for i_scp = 1:SCP_param.n_scp_iter
+            [~, gJ, HJ, F, JF, C, JC] = get_all_operators(z_k, current_states);
 
-        % Normalization
-        [gJ_n, HJ_n, F_n, JF_n, C_n, JC_n] = normalize_operators(gJ, HJ, F, JF, C, JC, sz, scales, N);
+            gJ = full(gJ);
+            HJ = full(HJ);
+            F  = full(F);
+            JF = full(JF);
+            C  = full(C);
+            JC = full(JC);
 
-%         [y, fval, exitflag, output] = solve_QP_problem(gJ_n, HJ_n, F_n, JF_n, C_n, JC_n, SCP_param);
-        [y, ~, ~, ~] = solve_QP_problem(gJ_n, HJ_n, F_n, JF_n, C_n, JC_n, SCP_param);
-    
-        % --- Extract solution ---
-        delta_z_norm = y(1:nz);
-%         s_dyn        = y(nz+1:end);
-        
-        % Convert normalized correction back to physical units
-        delta_z = sz .* delta_z_norm;
-        
-        % SCP update
-        z_kp1 = z_k + SCP_param.alpha * delta_z;
-        SCP_param.z_k = z_kp1;
+            % Normalization
+            [gJ_n, HJ_n, F_n, JF_n, C_n, JC_n] = normalize_operators(gJ, HJ, F, JF, C, JC, sz, scales, N);
+
+            [y, ~, exitflag, ~] = solve_QP_problem(gJ_n, HJ_n, F_n, JF_n, C_n, JC_n, SCP_param);
+
+            if isempty(y) || exitflag <= 0
+                SCP_param.last_scp_exitflag = exitflag;
+                if SCP_param.verbose_scp
+                    fprintf('SCP iter %d/%d: QP failed (exitflag=%d)\n', i_scp, SCP_param.n_scp_iter, exitflag);
+                end
+                if ~qp_success
+                    z_k = z_last_valid;
+                end
+                break;
+            end
+
+            % --- Extract solution ---
+            delta_z_norm = y(1:nz);
+            s_dyn = y(nz+1:end);
+            delta_norm = norm(delta_z_norm);
+            s_dyn_norm = norm(s_dyn);
+            SCP_param.last_scp_exitflag = exitflag;
+            SCP_param.last_scp_delta_norm = delta_norm;
+            SCP_param.last_scp_sdyn_norm = s_dyn_norm;
+
+            if SCP_param.verbose_scp
+                fprintf('SCP iter %d/%d: exitflag=%d, ||delta_z_norm||=%.3e, ||s_dyn||=%.3e\n', ...
+                    i_scp, SCP_param.n_scp_iter, exitflag, delta_norm, s_dyn_norm);
+            end
+
+            % Convert normalized correction back to physical units
+            delta_z = sz .* delta_z_norm;
+
+            % SCP update
+            z_last_valid = z_k;
+            z_k = z_k + SCP_param.alpha * delta_z;
+            qp_success = true;
+
+            if delta_norm < SCP_param.scp_delta_tol
+                if SCP_param.verbose_scp
+                    fprintf('SCP iter %d/%d: early stop (tol=%.3e)\n', i_scp, SCP_param.n_scp_iter, SCP_param.scp_delta_tol);
+                end
+                break;
+            end
+        end
+
+        SCP_param.z_k = z_k;
         
         updated_ctrls = 1;
         ctrl_time = current_time:SCP_param.dt_SCP:current_time+SCP_param.dt_SCP * (SCP_param.N-1);
-        U_kp1 = z_kp1(nx*(N+1)+1:end);
+        U_kp1 = z_k(nx*(N+1)+1:end);
         ctrl_values = reshape(U_kp1, nu, N);
     else
         updated_ctrls = 0;
